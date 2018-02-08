@@ -64,7 +64,8 @@
       ;; We're in a dev environment
       (progn
         (when (and *process*
-                   (eq (external-program:process-status *process*)
+                   (eq (external-program:process-status
+                        (ceramic.electron::external-process *process*))
                        :running))
           (warn "Interactive process already running. Restarting.")
           (stop-interactive))

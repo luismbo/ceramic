@@ -1,6 +1,6 @@
 (in-package :cl-user)
 (defpackage ceramic.electron
-  (:use :cl)
+  (:use :cl :parenscript)
   (:import-from :ceramic.util
                 :tell)
   (:import-from :ceramic.file
@@ -17,100 +17,144 @@
            :release-directory
            :global-binary-pathame
            :setup)
+  ;; Classes
+  (:export :process)
   ;; Functions
   (:export :*binary-pathname*
            :start-process
-           :send-command)
-  ;; Commands
-  (:export :create-window
-           :close-window
-           :destroy-window
-           :send-message
-           :show-window
-           :hide-window
-           :resize-window
-           :focus-window
-           :maximize-window
-           :unmaximize-window
-           :minimize-window
-           :unminimize-window
-           :fullscreen-window
-           :unfullscreen-window
-           :resizable-window
-           :unresizable-window
-           :center-window
-           :set-window-position
-           :set-window-title
-           :window-load-url
-           :window-reload
-           :window-open-dev-tools
-           :window-close-dev-tools
-           :window-undo
-           :window-redo
-           :window-cut
-           :window-paste
-           :window-delete
-           :window-select-all
-           :quit))
+           :eval-in-process))
 (in-package :ceramic.electron)
 
-(defun wait-for-startup (process)
-  "Wait until the Electron process has started and is ready to go."
-  (labels ((read-all-from-stream (stream)
-             (concatenate 'string
-                          (loop for byte = (read-char-no-hang stream nil nil)
-                                while byte collecting byte)))
-           (process-stdout ()
-             (read-all-from-stream
-              (external-program:process-output-stream
-               process))))
-    (ceramic.log:log-message "Waiting for startup...")
-    (let ((output (process-stdout)))
-      (loop until (search "READY" output) do
-        (let ((new-output (process-stdout)))
-          (setf output (concatenate 'string output new-output)))))
-    ;; Clear all stdout
-    (process-stdout)
-    (ceramic.log:log-message "Electron process started.")
-    t))
+(defclass process ()
+  ((external-process :initarg :external-process :reader external-process)
+   (app :reader process-app)))
+
+(defmethod initialize-instance :after ((p process) &key)
+  (with-slots (app) p
+    (setf app (make-instance 'app :process p))))
+
+(defgeneric output-stream (process)
+  (:method ((p process))
+    (external-program:process-output-stream (external-process p))))
+
+(defgeneric input-stream (process)
+  (:method ((p process))
+    (external-program:process-input-stream (external-process p))))
+
+(defclass app ()
+  ((process :initarg :process :reader app-process)
+   (windows :initform nil :accessor app-windows)))
+
+(defclass window ()
+  ((app :initarg :app :reader window-app)
+   (name :initarg :name :reader window-name)))
+
+(defun find-window (app window-name)
+  (or (find window-name
+            (app-windows app)
+            :test #'string=
+            :key #'window-name)
+      (error "Unable to find window named ~a" window-name)))
+
+(defmethod handle-event (target channel &rest args &key &allow-other-keys)
+  (format *debug-io*
+          "Unhandled ~a event for ~a: ~a"
+          channel target args))
+
+(alexandria:define-constant +magic-prefix+ "[CERAMIC-EVENT] " :test #'string=)
+
+(defun parse-and-handle-event (process line)
+  (flet ((keywordify (name)
+           (check-type name string)
+           (alexandria:make-keyword (string-upcase name))))
+    (let* ((event (with-input-from-string (s line :start (length +magic-prefix+))
+                    (cl-json:decode-json s)))
+           (emitter (keywordify (cdr (assoc :emitter event))))
+           (channel (keywordify (cdr (assoc :channel event))))
+           (window-name (cdr (assoc :window-name event)))
+           (args (cdr (assoc :args event))))
+      (apply #'handle-event
+             (ecase emitter
+               (:process process)
+               (:app (process-app process))
+               (:window (find-window (process-app process) window-name)))
+             channel
+             (alexandria:alist-plist args)))))
+
+;; { emitter: 'app',     channel: 'ready',    args: [] }
+;; { emitter: 'window',  channel: 'closed',   windowName: ?, args: [] }
+;; { emitter: 'process', channel: 'whatever', args: [] }
+(defun start-event-dispatcher (process)
+  (bt:start-multiprocessing)
+  (let ((stream (output-stream process)))
+    (bt:make-thread
+     (lambda ()
+       (loop for line = (read-line stream nil nil)
+             until (null line)
+             when (alexandria:starts-with-subseq +magic-prefix+ line)
+               do (restart-case
+                      (parse-and-handle-event process line)
+                    (ignore ()
+                      :report "Proceed, ignoring this event."))))
+     :name (format nil "Electron event dispacher~@[ (pid: ~a)~]"
+                   ;; Alas, PROCESS-ID is not implemented for all Lisps.
+                   (ignore-errors (external-program:process-id process))))))
 
 (defun start-process (directory &key operating-system)
   "Start an Electron process, returning the process object."
   (let* ((binary-pathname (binary-pathname directory
                                            :operating-system operating-system))
-         (process (external-program:start binary-pathname
-                                          (list)
-                                          :input :stream
-                                          :output :stream)))
-    (wait-for-startup process)
+         (external-process (external-program:start binary-pathname
+                                                   (list)
+                                                   :input :stream
+                                                   :output :stream))
+         (process (make-instance 'process :external-process external-process)))
+    (start-event-dispatcher process)
     process))
 
-(defun send-command (process command alist)
-  "Send a command Electron process."
-  (let ((json-string (cl-json:with-explicit-encoder
-                       (cl-json:encode-json-alist-to-string
-                        (append (list (cons "cmd" command))
-                                alist))))
-        (input-stream (external-program:process-input-stream process)))
-    (write-string json-string input-stream)
-    (write-char #\Newline input-stream)
-    (finish-output input-stream)
-    (ceramic.log:log-message "sent JSON ~A" json-string)
-    json-string))
+;; figure out a way to do return values (maybe use stderr)
+(defun send-request (stream target window-name code)
+  (cl-json:encode-json
+   `((:target . ,target)
+     (:window-name . ,window-name)
+     (:code . ,code))
+   stream)
+  (fresh-line stream)
+  (finish-output stream))
+
+(defun reval* (target code)
+  (etypecase target
+    (app
+     (send-request (input-stream (app-process target))
+                   :app nil code))
+    (window
+     ;; windows[request.windowName].webContents.executeJavascript(request.code)
+     ;; require('crash-reporter').start();
+     (send-request (input-stream (app-process (window-app target)))
+                   :window (window-name target) code))))
+
+(defmacro reval (target &body body)
+  (let ((*ps-print-pretty* nil))
+    `(reval* ,target ,(apply #'ps* body))))
 
 ;;; Commands
 
-(defmacro define-window-command (name string (&rest args) &body alist)
-  `(defun ,name (process name ,@args)
-     (send-command process
-                   ,string
-                   (append (list (cons "name" name))
-                           (progn
-                             ,@alist)))))
+(defun create-window (app options)
+  (reval app
+    (let ((window (new (*browser-window (lisp options))))
+          (id (lisp window-id)))
+      (setf (@ windows id) window)
+      ((@ window on) "closed" (lambda () (delete (@ windows id)))))))
 
-(define-window-command create-window "create-window" (options)
-  (append (list (cons "show" (cl-json:json-bool nil)))
-          options))
+(defun close-window (window)
+  (reval app
+    ((@ window (lisp (window-id window)) close))))
+
+(defun destroy-window (window)
+  (reval app
+    ((@ window (lisp (window-id window)) destroy))))
+
+
 
 (define-window-command close-window "close-window" ()
   ())
@@ -201,13 +245,16 @@
 (define-window-command window-select-all "window-select-all" ()
   ())
 
+(define-window-command window-eval "window-eval" (code)
+  (list (cons "code" code)))
+
 (defun quit (process)
   "End the Electron process."
   (send-command process "quit" nil))
 
 ;;; Interface
 
-(defvar *electron-version* "0.28.1"
+(defvar *electron-version* "0.36.8"
   "The version of Electron to use.")
 
 (defun release-directory ()
@@ -223,9 +270,74 @@
 (defun setup ()
   "Set up the Electron driver."
   (ensure-directories-exist (release-directory))
-  (progn
-    (get-release (release-directory)
-                 :operating-system *operating-system*
-                 :architecture *architecture*
-                 :version *electron-version*)
-    (prepare-release (release-directory) :operating-system *operating-system*)))
+  (get-release (release-directory)
+               :operating-system *operating-system*
+               :architecture *architecture*
+               :version *electron-version*)
+  (prepare-release (release-directory) :operating-system *operating-system*))
+
+(defun window-create ()
+  (let ((stream (external-program:process-input-stream
+                 (external-process ceramic::*process*))))
+    (cl-json:encode-json
+     `((:target . :app)
+       (:code . ,(let ((*ps-print-pretty* nil))
+                   (ps* `(let ((window (new (*browser-window #+nil options))))
+                           (setf (getprop windows "foo") window)
+                           (funcall (@ window on)
+                                    "closed"
+                                    (lambda ()
+                                      (setf (getprop windows "foo") nil))))))))
+     stream)
+    (fresh-line stream)
+    (finish-output stream)))
+
+(defun window-load-url ()
+  (let ((stream (external-program:process-input-stream
+                 (external-process ceramic::*process*))))
+    (cl-json:encode-json
+     `((:target . :app)
+       (:code . ,(let ((*ps-print-pretty* nil))
+                  (ps* `(funcall (@ windows "foo" load-u-r-l)
+                                 ,(format nil "data:text/html,~a"
+                                          (quri:url-encode "<html><body>yow</body></html>")))))))
+     stream)
+    (fresh-line stream)
+    (finish-output stream)))
+
+(defun window-show ()
+  (let ((stream (external-program:process-input-stream
+                 (external-process ceramic::*process*))))
+    (cl-json:encode-json
+     `((:target . "app")
+       (:code . ,(let ((*ps-print-pretty* nil))
+                   (ps* `(funcall (@ windows "foo" show))))))
+     stream)
+    (fresh-line stream)
+    (finish-output stream)))
+
+(defun app-quit ()
+  (let ((stream (external-program:process-input-stream
+                 (external-process ceramic::*process*))))
+    (cl-json:encode-json
+     `((:target . "app")
+       (:code . ,(let ((*ps-print-pretty* nil))
+                   (ps* `(funcall (@ app quit))))))
+     stream)
+    (fresh-line stream)
+    (finish-output stream)))
+
+(defun throw-error ()
+  (let ((stream (external-program:process-input-stream
+                 (external-process ceramic::*process*))))
+    (cl-json:encode-json
+     `((:target . "app")
+       (:code . ,(let ((*ps-print-pretty* nil))
+                  (ps* `(throw (new (*error "wat")))))))
+     stream)
+    (finish-output stream)))
+
+(defun window-close ()
+  (let ((*PS-PRINT-PRETTY* nil))
+    (ps* `(lambda (name) (funcall (getprop windows name 'close))))))
+

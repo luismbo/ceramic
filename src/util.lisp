@@ -74,7 +74,6 @@
     (archive::create-tar-file output files)
     output))
 
-(defmacro tell (format-string &rest args)
+(defun tell (format-string &rest args)
   "Log a message."
-  `(format t (concatenate 'string "~&" ,format-string)
-           ,@args))
+  (format t "~&~?" format-string args))

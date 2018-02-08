@@ -16,6 +16,7 @@
                :jonathan
                :cl-json
                :external-program
+               :bordeaux-threads
                :uuid
                :cl-fad
                :clack-handler-hunchentoot
